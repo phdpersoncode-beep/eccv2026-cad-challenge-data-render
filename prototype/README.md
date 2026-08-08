@@ -15,6 +15,9 @@ python /path/to/prototype/dxf_render.py examples/000000.dxf out_dxf.png
 # render the paired STEP the same way via OCC hidden line removal
 python /path/to/prototype/step_render.py examples/000000.step out_step.png
 
+# mesh-based HLR fallback for parts where exact HLR is pathologically slow
+python /path/to/prototype/step_render_poly.py examples/000003.step out_step.png
+
 # corpus-scale verification: sample N pairs, subprocess-per-item with hard timeout,
 # raw + similarity-aligned metrics appended to a resumable CSV
 python /path/to/prototype/run_verify.py /path/to/examples 300 results.csv

@@ -209,9 +209,12 @@ for five representative parts: `assets/plan_verification_examples.png`.
 
 ### 3.2 Full corpus — all 2018 DXF/STEP pairs in `examples/`
 
-2015 of 2018 pairs scored; the 3 remaining are exact-HLR timeouts (spline-heavy parts,
-> 150 s budget — the known heavy tail). "Aligned" = after the per-pair similarity fit
-described below.
+2015 of 2018 pairs scored with exact HLR; the 3 remaining are exact-HLR timeouts
+(spline-heavy parts — `000003` doesn't finish in 15 min). The mesh-based fallback
+(`prototype/step_render_poly.py`, `HLRBRep_PolyAlgo` on a 0.05 mm triangulation) renders
+each of them in **under 1 s**, scoring 0.93 / 0.93 / 0.49 — so the heavy tail is fully
+covered: exact HLR first, poly HLR on timeout. "Aligned" = after the per-pair similarity
+fit described below.
 
 | metric | raw mean | raw median | raw p10 | aligned mean | aligned median | aligned p10 |
 |---|---|---|---|---|---|---|
@@ -273,7 +276,7 @@ in the corpus and are now handled.
 
 | risk | mitigation |
 |---|---|
-| HLR slow / hangs on pathological B-splines (observed: `000003` > 25 min; corpus p90 is only 4.2 s) | per-item subprocess timeout; skip + manifest reason; parallel workers; optional fallback to mesh-based `HLRBRep_PolyAlgo` for the heavy tail |
+| HLR slow / hangs on pathological B-splines (3 of 2018 corpus parts; corpus p99 is only 6.3 s) | per-item subprocess timeout, then the **validated** mesh-based `HLRBRep_PolyAlgo` fallback (`prototype/step_render_poly.py`): < 1 s on all three pathological parts |
 | kernel classification differs from Parasolid on tangent/coincident edges | accepted — documented by challenge authors; a few short strokes per part on examples |
 | challenge drawings carry SW approximate-bbox scale/offset jitter (§3.2) | accepted as target-distribution fact; mirrored as train-time augmentation (§2.4); SFT tolerates the shift, RL on the challenge corpus closes the rest |
 | multi-solid parts and STEPs with stray shells / unbounded surfaces | solids-only compound + exact `AddOptimal` bbox + validity guards (§2.2.1); genuine assemblies skipped like the SolidWorks pipeline |
