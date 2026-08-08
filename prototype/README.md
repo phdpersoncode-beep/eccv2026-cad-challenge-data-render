@@ -15,10 +15,21 @@ python /path/to/prototype/dxf_render.py examples/000000.dxf out_dxf.png
 # render the paired STEP the same way via OCC hidden line removal
 python /path/to/prototype/step_render.py examples/000000.step out_step.png
 
-# compare all pairs (4 processes, 25 min/item timeout), then build a side-by-side sheet
-EXAMPLES_DIR=/path/to/examples python /path/to/prototype/parallel_compare.py
+# corpus-scale verification: sample N pairs, subprocess-per-item with hard timeout,
+# raw + similarity-aligned metrics appended to a resumable CSV
+python /path/to/prototype/run_verify.py /path/to/examples 300 results.csv
+
+# single pair with saved renders (cmp_dxf_*.png / cmp_step_*.png in cwd)
+python /path/to/prototype/verify_pair.py /path/to/examples 000000 --save-png
+
+# side-by-side sheet from saved renders
 python /path/to/prototype/contact_sheet.py sheet.png 000000 000004 000014
 ```
+
+`verify_pair.py` reports each pair twice: raw agreement, and agreement after fitting a
+per-part uniform scale + 3D offset (`fit_scale`, `fit_offset_mm` in the CSV). The fit
+isolates the SolidWorks approximate-bounding-box normalization jitter present in the
+challenge drawings from real structural differences — see PLAN.md §3.
 
 The scripts import each other (they share one rasterizer); invoking them by full path works
 because Python puts the script's own directory on `sys.path`. Outputs (`cmp_*.png`,

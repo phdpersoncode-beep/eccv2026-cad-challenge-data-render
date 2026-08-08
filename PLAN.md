@@ -108,9 +108,13 @@ No SolidWorks, no Windows, fully parallelizable on Linux.
 
 ### 2.2 STEP path — the core algorithm
 
-1. **Import & normalize.** `cq.importers.importStep`; translate bbox center to origin, scale so
-   the longest axis is 100 mm. (Challenge STEPs at 1.8 mm and raw corpus STEPs at any size both
-   land in the same place.)
+1. **Import & normalize.** `cq.importers.importStep`, then collect **solids only** into a
+   compound (some corpus STEPs carry stray shells/faces that poison the bounding box — one
+   even reports a 2·10¹⁰⁰ bbox; fall back to shells when a file has no solid). Compute the
+   **exact** bounding box with `BRepBndLib.AddOptimal` (tessellation-independent), reject
+   void/degenerate boxes, translate the center to the origin and scale the longest axis to
+   100 mm. Multi-body parts are kept whole. (Challenge STEPs at 1.8 mm and raw corpus STEPs
+   at any size both land in the same place.)
 2. **Per view, rotate the solid instead of moving the camera.** Apply the view rotation
    (transpose of the row-vector matrices in §1.2) with `gp_Trsf`, then always project with the
    same projector `HLRAlgo_Projector(gp_Ax2(origin, gp_Dir(0,0,1)))` — viewer on +Z. This
@@ -154,6 +158,18 @@ CadQuery):
 For STEP-only corpora (ABC, Fusion360) the same renderer produces the image side; those are
 useful for pretraining/augmentation only, since there is no code label.
 
+**Recommended augmentation (mirrors the challenge distribution, §3.2):** with some
+probability, apply a per-part uniform scale jitter (×0.92–1.00) and a small 3D offset
+(±4 mm at drawing scale) before projecting. The challenge drawings carry exactly this
+jitter from SolidWorks' approximate bounding-box normalization, so training with it closes
+most of the measurable input-distribution gap for free.
+
+**Training strategy:** SFT on our (render, CadQuery) pairs — accepting the small remaining
+distribution shift — then RL against the challenge training corpus, where rollouts are scored
+by executing generated CadQuery and comparing geometry. Residual render differences (bbox
+jitter, kernel edge classification) get absorbed there rather than by chasing pixel parity
+with SolidWorks rule-by-rule.
+
 Optional (phase 2): emit true DXF files alongside PNGs — write the HLR curves as layer-`0`
 entities with `Continuous`/`HIDDEN` linetypes via `ezdxf`, mirroring the SolidWorks encoding,
 so the dataset also contains challenge-format DXFs, not just rasters.
@@ -162,11 +178,14 @@ so the dataset also contains challenge-format DXFs, not just rasters.
 
 ## 3. Verification (done as part of this plan — prototype results)
 
-Prototypes of both paths (`from_dxf`, `from_step`) were run on the 26 DXF/STEP pairs in
-`examples/` (scripts in `prototype/`; side-by-side sheets can be regenerated with
-`prototype/parallel_compare.py` + `prototype/contact_sheet.py`, see `prototype/README.md`).
-Metric: symmetric stroke coverage — the fraction of one render's stroke pixels within 2 px
-(0.5 mm) of the other's, taking the worse direction, computed per class.
+Metric everywhere below: **symmetric stroke coverage** — the fraction of one render's stroke
+pixels within 2 px (0.5 mm) of the other's, taking the worse direction, computed per class.
+What we are verifying is exactly what the VLM will see: that the DXF→image and
+STEP→drawing→image paths produce consistent images. Tooling: `prototype/` (see its README);
+the harness becomes `pyrender/verify.py` and runs in CI on the bundled examples so any
+regression in the projection conventions is caught immediately.
+
+### 3.1 First release — 26 curated pairs
 
 Measured on 25/26 pairs (`000003` exceeded a 25-minute exact-HLR budget — see risks):
 
@@ -177,7 +196,8 @@ Measured on 25/26 pairs (`000003` exceeded a 25-minute exact-HLR budget — see 
 | hidden (red) | 0.991 | 0.999 | 0.957 |
 
 18 of 25 pairs score ≥ 0.99 on every metric with **zero fitted parameters** — the view layout,
-projection directions, scale and placement reproduce SolidWorks exactly.
+projection directions, scale and placement reproduce SolidWorks exactly. Side-by-side renders
+for five representative parts: `assets/plan_verification_examples.png`.
 
 - The coincidence filter (§2.2.5) is what makes hidden lines match: without it, hidden-line
   precision drops below 0.5 on some parts (e.g. `000001`: 0.45 → 0.97 with the filter).
@@ -187,8 +207,49 @@ projection directions, scale and placement reproduce SolidWorks exactly.
   silhouette SolidWorks merges away). They affect a few short strokes per part, not the
   drawing's structure.
 
-The comparison harness becomes `pyrender/verify.py` and runs in CI on the bundled examples so
-any regression in the projection conventions is caught immediately.
+### 3.2 Full corpus — all 2018 DXF/STEP pairs in `examples/`
+
+Interim numbers from the first 273 verified pairs (the full 2018-pair run is executing;
+this table will be refreshed in this PR when it completes):
+
+| metric | raw mean | raw median | raw p10 | aligned mean | aligned median | aligned p10 |
+|---|---|---|---|---|---|---|
+| all strokes | 0.943 | 1.000 | 0.816 | 0.977 | 1.000 | 0.943 |
+| visible | 0.937 | 1.000 | 0.807 | 0.976 | 1.000 | 0.941 |
+| hidden | 0.912 | 0.973 | 0.754 | 0.942 | 0.978 | 0.852 |
+
+Share of pairs at ≥ 0.95 / ≥ 0.90 on all strokes: raw 0.80 / 0.86, aligned 0.88 / 0.94.
+Fitted jitter across the corpus: scale median 1.000 (p5 0.985), offset median 0.0 mm
+(p95 1.5 mm) — most parts have none, the tail carries it all. Zero errors and zero
+timeouts so far; runtime median 2.9 s, p90 4.2 s per part (three exact-HLR views) —
+roughly 1 000 parts/CPU-hour, embarrassingly parallel.
+
+The curated examples hid a phenomenon the full corpus exposes: **the challenge drawings carry
+per-part normalization jitter.** SolidWorks normalized each part with its approximate
+`GetPartBox` (documented as approximate — see `docs/KNOWN_DIFFERENCES.md`), so a drawing's
+effective scale can be off by up to ~8 % and its center by several mm versus exact-bbox
+normalization — rigidly, per part. To separate that jitter from real geometric disagreement,
+the harness also fits a single uniform scale + 3D offset per pair (two parameters of the SW
+bbox error, no rotation, nothing shape-specific) and re-scores. Examples: `006464` scores
+0.59 raw but **1.000** aligned (7.5 % scale + 3.7 mm offset); `002197` 0.63 → **1.000**
+(pure 3.6 mm offset).
+
+What the tail contains (each case checked visually):
+
+1. **SW bbox jitter** (dominant) — rigid shift/scale, geometry identical. We mirror it as
+   augmentation (§2.4) and let SFT + RL absorb the rest; reproducing SolidWorks' proprietary
+   bbox per part is not possible by rule, and per our training strategy it does not need to be.
+2. **Kernel edge-classification differences** (as in §3.1) — a few short strokes per part.
+3. **Challenge-data idiosyncrasies reproduced faithfully** — e.g. `004395`'s DXF differs from
+   its STEP in the challenge data itself; whatever the drawing set contains is by definition
+   the train/test distribution, so these count as distribution facts, not render errors. True
+   outliers (e.g. `000540`, whose DXF shows a different part than its STEP contains) are rare
+   and detectable by low aligned agreement. For training data generated from CadQuery code
+   such mismatches cannot occur — image and label come from the same solid.
+
+The importer hardening (§2.2.1) came out of this run: multi-body compounds, stray shells with
+unbounded surfaces, and off-nominal STEP sizes (one at 0.59 mm instead of 1.8 mm) all appear
+in the corpus and are now handled.
 
 ## 4. Implementation steps
 
@@ -209,9 +270,11 @@ any regression in the projection conventions is caught immediately.
 
 | risk | mitigation |
 |---|---|
-| HLR slow / hangs on pathological B-splines (observed: `000003` > 25 min) | per-item subprocess timeout; skip + manifest reason; parallel workers; optional fallback to mesh-based `HLRBRep_PolyAlgo` for the heavy tail |
-| kernel classification differs from Parasolid on tangent/coincident edges | accepted — documented by challenge authors; quantified at ~2–6 % of stroke pixels on examples |
-| multi-solid / assembly STEPs | skip (same policy as the SolidWorks pipeline) |
+| HLR slow / hangs on pathological B-splines (observed: `000003` > 25 min; corpus p90 is only 4.2 s) | per-item subprocess timeout; skip + manifest reason; parallel workers; optional fallback to mesh-based `HLRBRep_PolyAlgo` for the heavy tail |
+| kernel classification differs from Parasolid on tangent/coincident edges | accepted — documented by challenge authors; a few short strokes per part on examples |
+| challenge drawings carry SW approximate-bbox scale/offset jitter (§3.2) | accepted as target-distribution fact; mirrored as train-time augmentation (§2.4); SFT tolerates the shift, RL on the challenge corpus closes the rest |
+| multi-solid parts and STEPs with stray shells / unbounded surfaces | solids-only compound + exact `AddOptimal` bbox + validity guards (§2.2.1); genuine assemblies skipped like the SolidWorks pipeline |
+| mispaired DXF/STEP items in the challenge corpus (e.g. `000540`) | detectable by low aligned agreement; irrelevant for generated training pairs (image and label share one solid) |
 | CadQuery scripts with side effects / infinite loops | sandboxed subprocess execution, resource limits |
 | a corpus part that degenerates at 100 mm scale (zero-thickness) | validate solid volume > 0 before HLR; skip otherwise |
 | views overlapping sheet bounds for extreme aspect ratios | outline check; parts are ≤ 100 mm in every axis, fixed layout fits A4 as in the original pipeline; clip + flag if exceeded |

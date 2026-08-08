@@ -32,12 +32,47 @@ VIEWS = {
 DEFLECTION = 0.05  # mm discretization tolerance
 
 
+def _collect(shape_ocp, kind, caster):
+    exp = TopExp_Explorer(shape_ocp, kind)
+    out = []
+    while exp.More():
+        out.append(cq.Shape.cast(caster(exp.Current())))
+        exp.Next()
+    return out
+
+
 def normalized_shape(step_file):
-    shape = cq.importers.importStep(step_file).val()
-    bb = shape.BoundingBox()
-    scale = TARGET_MAX_DIM / max(bb.xlen, bb.ylen, bb.zlen)
-    moved = shape.translate((-bb.center.x, -bb.center.y, -bb.center.z))
-    return moved.scale(scale)
+    """Import STEP -> compound of solids, bbox-centered at origin, max dim = TARGET_MAX_DIM.
+
+    Uses solids only (stray shells/faces in some corpus files poison the bbox) and the
+    exact BRepBndLib.AddOptimal bounding box (tessellation-independent).
+    """
+    from OCP.TopAbs import TopAbs_SOLID, TopAbs_SHELL
+    from OCP.Bnd import Bnd_Box
+    from OCP.BRepBndLib import BRepBndLib
+
+    vals = cq.importers.importStep(step_file).vals()
+    parts = []
+    for v in vals:
+        parts.extend(_collect(v.wrapped, TopAbs_SOLID, TopoDS.Solid_s))
+    if not parts:  # fall back to shells for non-solid models
+        for v in vals:
+            parts.extend(_collect(v.wrapped, TopAbs_SHELL, TopoDS.Shell_s))
+    if not parts:
+        raise ValueError("no solids or shells in STEP")
+    shape = parts[0] if len(parts) == 1 else cq.Compound.makeCompound(parts)
+
+    box = Bnd_Box()
+    BRepBndLib.AddOptimal_s(shape.wrapped, box, True, False)
+    if box.IsVoid():
+        raise ValueError("void bounding box")
+    xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+    max_dim = max(xmax - xmin, ymax - ymin, zmax - zmin)
+    if not (1e-9 < max_dim < 1e6):
+        raise ValueError(f"degenerate bounding box (max dim {max_dim:g})")
+    center = ((xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2)
+    moved = shape.translate((-center[0], -center[1], -center[2]))
+    return moved.scale(TARGET_MAX_DIM / max_dim)
 
 
 def rotate_for_view(shape_ocp, R_rows):
@@ -142,7 +177,8 @@ def step_polylines(step_file):
             polys.append(([(x + cx, y + cy) for x, y in pts], "visible"))
         for pts in hid:
             polys.append(([(x + cx, y + cy) for x, y in pts], "hidden"))
-        print(f"  {name}: {len(vis)} visible, {len(hid)} hidden edges (after coincidence filter)")
+        print(f"  {name}: {len(vis)} visible, {len(hid)} hidden edges (after coincidence filter)",
+              file=sys.stderr)
     return polys
 
 

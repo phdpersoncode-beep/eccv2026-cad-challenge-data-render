@@ -55,7 +55,8 @@ def render(polylines, out_png, line_px=2):
             if kind != kind_pass:
                 continue
             draw.line([to_px(p) for p in pts], fill=color, width=line_px, joint="curve")
-    img.save(out_png)
+    if out_png:
+        img.save(out_png)
     return img
 
 
