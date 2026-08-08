@@ -1,7 +1,8 @@
 """Verify one DXF/STEP pair: render both, compare, print one CSV line to stdout.
 
-CSV: stem,status,all,visible,hidden,hid_recall,hid_precision,seconds,n_vis,n_hid
-Optionally saves the two renders with --save-png.
+CSV: stem,status,all,visible,hidden,hid_recall,hid_precision,seconds,n_vis,n_hid,
+     fit_scale,fit_offset_mm,adj_all,adj_visible,adj_hidden
+Optionally saves the two renders with --save-png (cmp_*.png in the current directory).
 """
 import os
 import sys
@@ -63,6 +64,11 @@ def fit_similarity(dpolys, spolys):
                               tv[2][1] if tv[2] is not None else None) if v is not None] or [0])
     tz = np.mean([v for v in (-tv[1][1] if tv[1] is not None else None,
                               -tv[2][0] if tv[2] is not None else None) if v is not None] or [0])
+    # SW bbox jitter is small; a fit outside these bounds means the estimate itself is
+    # broken (view misassignment on unusual layouts) — fall back to identity
+    t_mag = float(tx * tx + ty * ty + tz * tz) ** 0.5
+    if not (0.8 <= s <= 1.25) or t_mag > 20.0:
+        return 1.0, (0.0, 0.0, 0.0)
     return s, (float(tx), float(ty), float(tz))
 
 

@@ -58,15 +58,27 @@ def normalized_shape(step_file):
     if not parts:  # fall back to shells for non-solid models
         for v in vals:
             parts.extend(_collect(v.wrapped, TopAbs_SHELL, TopoDS.Shell_s))
-    if not parts:
-        raise ValueError("no solids or shells in STEP")
+
+    def finite_box(shape):
+        box = Bnd_Box()
+        BRepBndLib.AddOptimal_s(shape.wrapped, box, True, False)
+        if box.IsVoid():
+            return None
+        vs = box.Get()
+        if max(abs(c) for c in vs) > 1e6:
+            return None
+        return vs
+
+    # drop bodies whose own bbox is unbounded (corrupt surfaces in some corpus files)
+    kept = [(p, fb) for p in parts if (fb := finite_box(p)) is not None]
+    if not kept:
+        raise ValueError("no solids or shells with a finite bounding box")
+    parts = [p for p, _ in kept]
+    boxes = [fb for _, fb in kept]
     shape = parts[0] if len(parts) == 1 else cq.Compound.makeCompound(parts)
 
-    box = Bnd_Box()
-    BRepBndLib.AddOptimal_s(shape.wrapped, box, True, False)
-    if box.IsVoid():
-        raise ValueError("void bounding box")
-    xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+    xmin = min(b[0] for b in boxes); ymin = min(b[1] for b in boxes); zmin = min(b[2] for b in boxes)
+    xmax = max(b[3] for b in boxes); ymax = max(b[4] for b in boxes); zmax = max(b[5] for b in boxes)
     max_dim = max(xmax - xmin, ymax - ymin, zmax - zmin)
     if not (1e-9 < max_dim < 1e6):
         raise ValueError(f"degenerate bounding box (max dim {max_dim:g})")

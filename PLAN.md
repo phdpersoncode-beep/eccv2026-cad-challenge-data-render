@@ -209,20 +209,23 @@ for five representative parts: `assets/plan_verification_examples.png`.
 
 ### 3.2 Full corpus — all 2018 DXF/STEP pairs in `examples/`
 
-Interim numbers from the first 273 verified pairs (the full 2018-pair run is executing;
-this table will be refreshed in this PR when it completes):
+2015 of 2018 pairs scored; the 3 remaining are exact-HLR timeouts (spline-heavy parts,
+> 150 s budget — the known heavy tail). "Aligned" = after the per-pair similarity fit
+described below.
 
 | metric | raw mean | raw median | raw p10 | aligned mean | aligned median | aligned p10 |
 |---|---|---|---|---|---|---|
-| all strokes | 0.943 | 1.000 | 0.816 | 0.977 | 1.000 | 0.943 |
-| visible | 0.937 | 1.000 | 0.807 | 0.976 | 1.000 | 0.941 |
-| hidden | 0.912 | 0.973 | 0.754 | 0.942 | 0.978 | 0.852 |
+| all strokes | 0.943 | 1.000 | 0.812 | 0.978 | 1.000 | 0.938 |
+| visible | 0.936 | 0.999 | 0.795 | 0.976 | 1.000 | 0.933 |
+| hidden | 0.906 | 0.974 | 0.703 | 0.940 | 0.978 | 0.838 |
 
-Share of pairs at ≥ 0.95 / ≥ 0.90 on all strokes: raw 0.80 / 0.86, aligned 0.88 / 0.94.
-Fitted jitter across the corpus: scale median 1.000 (p5 0.985), offset median 0.0 mm
-(p95 1.5 mm) — most parts have none, the tail carries it all. Zero errors and zero
-timeouts so far; runtime median 2.9 s, p90 4.2 s per part (three exact-HLR views) —
-roughly 1 000 parts/CPU-hour, embarrassingly parallel.
+Share of pairs with all-stroke agreement ≥ 0.99 / 0.95 / 0.90 / 0.80:
+raw 0.63 / 0.79 / 0.86 / 0.90 — aligned 0.69 / 0.87 / **0.94** / 0.98.
+Fitted jitter: ~two-thirds of parts need none at all; among the 697 parts with a non-zero
+offset the median is 0.2 mm (p95 3.5 mm), and the p5 scale is 0.986. Runtime: median 2.9 s,
+p90 3.9 s, p99 6.3 s per part (three exact-HLR views) — roughly 1 000 parts/CPU-hour,
+embarrassingly parallel. Review sheets for the worst-aligned pairs, a random sample of clean
+pairs, and the import-hardening cases: `assets/verification_review/`.
 
 The curated examples hid a phenomenon the full corpus exposes: **the challenge drawings carry
 per-part normalization jitter.** SolidWorks normalized each part with its approximate
