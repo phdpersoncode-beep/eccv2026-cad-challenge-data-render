@@ -17,7 +17,7 @@ from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
 from OCP.BRepAdaptor import BRepAdaptor_Curve
 from OCP.GCPnts import GCPnts_QuasiUniformDeflection
 from OCP.TopExp import TopExp_Explorer
-from OCP.TopAbs import TopAbs_EDGE
+from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE
 from OCP.TopoDS import TopoDS
 
 from dxf_render import render  # reuse rasterizer
@@ -41,11 +41,17 @@ def _collect(shape_ocp, kind, caster):
     return out
 
 
-def normalized_shape(step_file):
-    """Import STEP -> compound of solids, bbox-centered at origin, max dim = TARGET_MAX_DIM.
+def normalization(step_file, report=None):
+    """Import STEP -> (shape, bbox center, scale to TARGET_MAX_DIM), geometry untouched.
 
     Uses solids only (stray shells/faces in some corpus files poison the bbox) and the
     exact BRepBndLib.AddOptimal bounding box (tessellation-independent).
+
+    The centering and scaling are deliberately *not* baked into the B-rep. Applying them
+    (cq's translate/scale, like any BRepBuilderAPI_Transform with copy=True) reruns the
+    shape through BRepTools_Modifier, and on some corpus parts the rebuilt faces make
+    exact HLR abort and return an empty view (see hlr_view / step_polylines). Orthographic
+    projection commutes with both, so step_polylines applies them to the 2D result instead.
     """
     from OCP.TopAbs import TopAbs_SOLID, TopAbs_SHELL
     from OCP.Bnd import Bnd_Box
@@ -73,6 +79,12 @@ def normalized_shape(step_file):
     kept = [(p, fb) for p in parts if (fb := finite_box(p)) is not None]
     if not kept:
         raise ValueError("no solids or shells with a finite bounding box")
+    dropped = len(parts) - len(kept)
+    if dropped:  # never drop geometry silently — a dropped body can be a whole view
+        print(f"  normalize: dropped {dropped} of {len(parts)} bodies (non-finite bbox)",
+              file=sys.stderr)
+    if report is not None:
+        report["dropped_bodies"] = dropped
     parts = [p for p, _ in kept]
     boxes = [fb for _, fb in kept]
     shape = parts[0] if len(parts) == 1 else cq.Compound.makeCompound(parts)
@@ -83,18 +95,30 @@ def normalized_shape(step_file):
     if not (1e-9 < max_dim < 1e6):
         raise ValueError(f"degenerate bounding box (max dim {max_dim:g})")
     center = ((xmin + xmax) / 2, (ymin + ymax) / 2, (zmin + zmax) / 2)
-    moved = shape.translate((-center[0], -center[1], -center[2]))
-    return moved.scale(TARGET_MAX_DIM / max_dim)
+    size = (xmax - xmin, ymax - ymin, zmax - zmin)
+    return shape, center, TARGET_MAX_DIM / max_dim, size
 
 
-def rotate_for_view(shape_ocp, R_rows):
+def normalized_shape(step_file, report=None):
+    """normalization() with the centering and scaling baked into the B-rep.
+
+    Kept for the poly-HLR path and external callers; the exact-HLR path must not use it
+    (the rebuild it triggers is what empties views — see normalization).
+    """
+    shape, center, scale, _ = normalization(step_file, report)
+    return shape.translate((-center[0], -center[1], -center[2])).scale(scale)
+
+
+def rotate_for_view(shape_ocp, R_rows, copy=False):
     # p' = p . R (row vector)  ==  p' = R^T p (column vector); gp_Trsf wants row-major of the matrix M with p' = M p
     M = [[R_rows[j][i] for j in range(3)] for i in range(3)]  # transpose
     tr = gp_Trsf()
     tr.SetValues(M[0][0], M[0][1], M[0][2], 0,
                  M[1][0], M[1][1], M[1][2], 0,
                  M[2][0], M[2][1], M[2][2], 0)
-    return BRepBuilderAPI_Transform(shape_ocp, tr, True).Shape()
+    # copy=False keeps the rotation as a TopLoc location: the B-rep is not rebuilt, so HLR
+    # sees the surfaces the STEP file actually carries (and we skip a modifier per view)
+    return BRepBuilderAPI_Transform(shape_ocp, tr, copy).Shape()
 
 
 def edges_of(compound):
@@ -106,16 +130,27 @@ def edges_of(compound):
         exp.Next()
 
 
-def discretize(edge):
+UNIFORM_SAMPLES = 32  # points used when deflection sampling refuses a curve
+
+
+def discretize(edge, deflection=DEFLECTION):
+    """Edge -> [(x, y), ...] at `deflection` sagitta, in the edge's own units."""
     curve = BRepAdaptor_Curve(edge)
-    disc = GCPnts_QuasiUniformDeflection(curve, DEFLECTION)
-    if not disc.IsDone():
+    disc = GCPnts_QuasiUniformDeflection(curve, deflection)
+    if disc.IsDone():
+        return [(disc.Value(i).X(), disc.Value(i).Y()) for i in range(1, disc.NbPoints() + 1)]
+    # deflection sampling gives up on some curves (degenerate parametrization); sample the
+    # parameter range uniformly instead of dropping the edge from the drawing
+    u0, u1 = curve.FirstParameter(), curve.LastParameter()
+    if not (u1 > u0):
+        print(f"    discretize: unusable curve range [{u0:g}, {u1:g}] — edge skipped", file=sys.stderr)
         return []
-    return [(disc.Value(i).X(), disc.Value(i).Y()) for i in range(1, disc.NbPoints() + 1)]
+    pts = [curve.Value(u0 + (u1 - u0) * i / UNIFORM_SAMPLES) for i in range(UNIFORM_SAMPLES + 1)]
+    return [(p.X(), p.Y()) for p in pts]
 
 
-def hlr_view(shape_ocp):
-    """Run HLR looking from +Z; returns (visible_edges, hidden_edges) as point lists in view XY mm."""
+def hlr_view(shape_ocp, deflection=DEFLECTION):
+    """Run HLR looking from +Z; returns (visible_edges, hidden_edges) as point lists in view XY."""
     algo = HLRBRep_Algo()
     algo.Add(shape_ocp)
     algo.Projector(HLRAlgo_Projector(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1))))
@@ -123,19 +158,62 @@ def hlr_view(shape_ocp):
     algo.Hide()
     hlr = HLRBRep_HLRToShape(algo)
     vis, hid = [], []
-    for getter, sink in ((hlr.VCompound, vis), (hlr.OutLineVCompound, vis),
-                         (hlr.HCompound, hid), (hlr.OutLineHCompound, hid)):
+    for name, getter, sink in (("VCompound", hlr.VCompound, vis),
+                               ("OutLineVCompound", hlr.OutLineVCompound, vis),
+                               ("HCompound", hlr.HCompound, hid),
+                               ("OutLineHCompound", hlr.OutLineHCompound, hid)):
         try:
             comp = getter()
-        except Exception:
+        except Exception as ex:  # an empty compound is normal, a raising getter is not
+            print(f"    HLR {name} failed: {type(ex).__name__}: {ex}", file=sys.stderr)
             continue
-        if comp is None:
+        if comp is None or comp.IsNull():
             continue
         for edge in edges_of(comp):
-            pts = discretize(edge)
+            pts = discretize(edge, deflection)
             if len(pts) >= 2:
                 sink.append(pts)
     return vis, hid
+
+
+# A point of the part cannot project outside the projection of the part's own bounding box,
+# so neither can any edge HLR reports. OCC's exact HLR breaks that on NURBS faces: it fits the
+# face silhouette with one single-span degree-8..10 curve, and when that fit does not converge
+# the poles land 20-200x the part size away, so the "outline" edge discretizes into a stroke
+# running clear off the sheet (or looping back as a lens hanging off the side of a view). The
+# bbox test removes those and provably cannot touch a genuine silhouette, which lies on the solid.
+BBOX_MARGIN = 0.1  # mm, numerical slack (2 x the chordal deflection), not a tuned threshold:
+                   # measured excess is <= 0.001 mm for every real stroke and >= 0.7 mm for every
+                   # phantom, so any margin in [0.02, 0.5] gives identical renders
+
+
+def view_bbox(size, scale, R, view_center, margin=BBOX_MARGIN):
+    """Sheet-mm box that every projected edge of the part must lie in, for one view.
+
+    `size` is the model bounding box from normalization(). All three view rotations are signed
+    axis permutations, so the projected extent along each screen axis is just the model extent
+    along the axis that lands on it (the |R| sum below is that, written as interval arithmetic);
+    the centering puts the box center exactly on the view center.
+    """
+    cx, cy = view_center
+    hx = 0.5 * scale * sum(abs(R[j][0]) * size[j] for j in range(3))
+    hy = 0.5 * scale * sum(abs(R[j][1]) * size[j] for j in range(3))
+    return (cx - hx - margin, cy - hy - margin, cx + hx + margin, cy + hy + margin)
+
+
+def drop_outside_bbox(polys, bbox, tag=""):
+    """Drop polylines leaving `bbox` — they cannot be edges of this part (see BBOX_MARGIN)."""
+    x0, y0, x1, y1 = bbox
+    kept, dropped = [], 0
+    for pts in polys:
+        if all(x0 <= x <= x1 and y0 <= y <= y1 for x, y in pts):
+            kept.append(pts)
+        else:
+            dropped += 1
+    if dropped:  # never drop geometry silently
+        print(f"    dropped {dropped} {tag} edge(s) leaving the part's projected bbox",
+              file=sys.stderr)
+    return kept, dropped
 
 
 COINCIDENCE_EPS = 0.15   # mm: hidden points closer than this to visible geometry count as coincident
@@ -177,18 +255,55 @@ def filter_coincident_hidden(vis, hid):
     return kept
 
 
-def step_polylines(step_file):
-    base = normalized_shape(step_file)
+def step_polylines(step_file, report=None):
+    """STEP -> [(points_mm, 'visible'|'hidden'), ...] placed on the sheet, three views.
+
+    Pass a dict as `report` to get the diagnostics a corpus harness should flag on:
+    'dropped_bodies', 'empty_views' (views with no visible edge — a silently wrong render),
+    'poly_fallback_views' (views that only came out of the mesh HLR retry) and
+    'offbbox_edges' (HLR edges rejected as phantoms — see drop_outside_bbox).
+    """
+    if report is not None:
+        report.update(dropped_bodies=0, empty_views=[], poly_fallback_views=[],
+                      offbbox_edges=0)
+    shape, center, scale, size = normalization(step_file, report)
+    # HLR runs on the un-normalized B-rep, so the deflection has to be un-normalized too
+    deflection = DEFLECTION / scale
+    has_faces = TopExp_Explorer(shape.wrapped, TopAbs_FACE).More()
     polys = []
-    for name, (R, center) in VIEWS.items():
-        rotated = rotate_for_view(base.wrapped, R)
-        vis, hid = hlr_view(rotated)
+    for name, (R, view_center) in VIEWS.items():
+        rotated = rotate_for_view(shape.wrapped, R)
+        vis, hid = hlr_view(rotated, deflection)
+        if not vis and has_faces:
+            # exact HLR abandons the whole view when it chokes on one face; the mesh engine
+            # is immune, so retry there rather than emit a view that is silently empty
+            print(f"  {name}: exact HLR returned no visible edge — retrying with poly HLR",
+                  file=sys.stderr)
+            from step_render_poly import poly_hlr_view  # local: that module imports this one
+            vis, hid = poly_hlr_view(rotated, deflection)
+            if vis and report is not None:
+                report["poly_fallback_views"].append(name)
+        if not vis and has_faces:
+            print(f"  {name}: VIEW IS EMPTY — render is incomplete", file=sys.stderr)
+            if report is not None:
+                report["empty_views"].append(name)
+        # normalization is applied here, not to the B-rep: an orthographic projection
+        # commutes with a uniform scale about the origin and with a translation
+        ox = sum(center[j] * R[j][0] for j in range(3))
+        oy = sum(center[j] * R[j][1] for j in range(3))
+        cx, cy = view_center
+        vis = [[((x - ox) * scale + cx, (y - oy) * scale + cy) for x, y in pts] for pts in vis]
+        hid = [[((x - ox) * scale + cx, (y - oy) * scale + cy) for x, y in pts] for pts in hid]
+        # reject HLR silhouettes that blow up outside the part (see BBOX_MARGIN); before the
+        # coincidence filter, so a phantom visible stroke cannot mask a genuine hidden edge
+        bbox = view_bbox(size, scale, R, view_center)
+        vis, n_ov = drop_outside_bbox(vis, bbox, f"{name} visible")
+        hid, n_oh = drop_outside_bbox(hid, bbox, f"{name} hidden")
+        if report is not None:
+            report["offbbox_edges"] += n_ov + n_oh
         hid = filter_coincident_hidden(vis, hid)
-        cx, cy = center
-        for pts in vis:
-            polys.append(([(x + cx, y + cy) for x, y in pts], "visible"))
-        for pts in hid:
-            polys.append(([(x + cx, y + cy) for x, y in pts], "hidden"))
+        polys.extend((pts, "visible") for pts in vis)
+        polys.extend((pts, "hidden") for pts in hid)
         print(f"  {name}: {len(vis)} visible, {len(hid)} hidden edges (after coincidence filter)",
               file=sys.stderr)
     return polys

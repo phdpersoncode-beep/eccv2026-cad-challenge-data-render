@@ -114,18 +114,43 @@ No SolidWorks, no Windows, fully parallelizable on Linux.
    **exact** bounding box with `BRepBndLib.AddOptimal` (tessellation-independent), reject
    void/degenerate boxes, translate the center to the origin and scale the longest axis to
    100 mm. Multi-body parts are kept whole. (Challenge STEPs at 1.8 mm and raw corpus STEPs
-   at any size both land in the same place.)
+   at any size both land in the same place.) The centering and scaling are computed but
+   **not applied to the B-rep** — see step 2a.
 2. **Per view, rotate the solid instead of moving the camera.** Apply the view rotation
    (transpose of the row-vector matrices in §1.2) with `gp_Trsf`, then always project with the
    same projector `HLRAlgo_Projector(gp_Ax2(origin, gp_Dir(0,0,1)))` — viewer on +Z. This
    guarantees the screen/depth conventions match the table above with no per-view sign traps.
+2a. **Never rebuild the B-rep.** The rotation is carried as a `TopLoc` location
+   (`BRepBuilderAPI_Transform(..., copy=False)`) and the normalization of step 1 is applied to
+   the resulting **2D** polylines, which is exact because an orthographic projection commutes
+   with a uniform scale about the origin and with a translation. The reason is not tidiness:
+   passing a shape through `BRepTools_Modifier` — which any `copy=True` transform or a
+   `translate`/`scale` does — makes exact HLR abandon *entire views*, returning all four
+   compounds null, when one rebuilt face trips a degeneracy in its silhouette computation.
+   Four parts in a 288-stem scan rendered with a blank view for this reason. A view that
+   still comes out empty is retried on the mesh HLR engine and, failing that, recorded in
+   `report['empty_views']` rather than emitted silently. The consequence is that HLR runs at
+   the file's own scale (1.8 mm for challenge STEPs) rather than at 100 mm, 55× closer to OCC's
+   absolute tolerances; measured directly this is free on ordinary parts (30 random dev parts:
+   18.4 s → 18.0 s) and costs only on the pathological tail (`002313` 51 s → 82 s), which the
+   per-item timeout and poly-HLR fallback already cover. There is no way to give HLR scaled
+   geometry without a rebuild — a scaling projector or location returns curves whose trim
+   ranges are not rescaled (see FIX_IDEAS.md §1).
 3. **Hidden line removal.** `HLRBRep_Algo` → `Update()` → `Hide()` → `HLRBRep_HLRToShape`:
    - visible = `VCompound` + `OutLineVCompound` (sharp edges + silhouettes)
    - hidden = `HCompound` + `OutLineHCompound`
    - `Rg1Line*` / `IsoLine*` compounds are **excluded** — this is exactly SolidWorks
      "tangent edges hidden"
 4. **Discretize** every edge with `GCPnts_QuasiUniformDeflection` (0.05 mm sagitta — well below
-   one pixel at 4 px/mm).
+   one pixel at 4 px/mm), falling back to uniform parameter sampling on the curves it refuses.
+4a. **Projected-bbox filter.** OCC fits each NURBS face's silhouette with a single-span
+   degree-8..10 B-spline; when that fit fails to converge the poles land 20-200× the part size
+   away and the curve genuinely evaluates out there, drawing a stroke clear off the sheet.
+   Nothing on the solid can project outside the solid's own projected bounding box, so any
+   polyline leaving it is dropped. The box is computed analytically per view — the view
+   rotations are signed axis permutations, so it is exact — and the 0.1 mm margin is numerical
+   slack, not a tuned threshold: legitimate strokes stay within 0.001 mm of the box and
+   phantoms are at least 0.7 mm outside, a 700× separation.
 5. **Coincidence filter (the one non-obvious step).** SolidWorks merges a hidden edge that
    projects exactly onto a visible edge into the visible one; OCC reports both. Without
    filtering, renders grow red fringes along white lines that the ground-truth DXFs do not
@@ -257,6 +282,49 @@ The importer hardening (§2.2.1) came out of this run: multi-body compounds, str
 unbounded surfaces, and off-nominal STEP sizes (one at 0.59 mm instead of 1.8 mm) all appear
 in the corpus and are now handled.
 
+### 3.3 Renderer fixes measured against a held-out split
+
+The §3.2 review sheets exposed three failure classes; two are now fixed (§2.2.2a and §2.2.4a)
+and the third turned out to be misdiagnosed. `FIX_IDEAS.md` records the causes, the fixes and
+the refutations in full.
+
+**Protocol.** Because the failure classes were found by looking at specific parts, every claim
+is scored on two disjoint samples: the 2018 pairs are split by `md5(stem)` into a dev pool and
+a held-out pool, and each change is measured on a 250-stem sample of each. Dev is where the
+iteration happens; held-out is only ever scored. None of the nine parts that motivated the
+fixes falls in either sample, so the numbers below are out-of-sample throughout.
+
+| | dev `adj_all` | dev ≥ 0.90 | dev worst | held-out `adj_all` | held-out p10 | held-out ≥ 0.90 |
+|---|---|---|---|---|---|---|
+| §3.2 baseline | 0.9824 | 0.964 | 0.570 | 0.9754 | 0.9271 | 0.940 |
+| + empty-view fix | 0.9862 | 0.976 | 0.773 | 0.9768 | 0.9305 | 0.944 |
+| + phantom-outline filter | **0.9863** | **0.976** | **0.773** | **0.9769** | **0.9305** | **0.944** |
+
+The phantom filter is deliberately a near-no-op on a random sample — it fires on ~0.4 % of
+parts and regresses **none** of the 500, which is the property that matters for a filter that
+deletes geometry. Its effect is on the tail: `005929` 0.953 → 0.984, `003966` 0.413 → 0.604,
+and `005929`'s fitted similarity offset collapses 5.35 mm → 0.00, so a phantom stroke had been
+corrupting the alignment fit as well as the render.
+
+**Rejected after measurement**, recorded so they are not retried:
+
+- *Segment-level coincidence filtering* (the proposed fix for the hidden-line residual):
+  improves the hidden-line median 0.9772 → 0.9849 but regresses the composite on 17 dev parts
+  against 1 and lowers the p10 tail. The fragments it cuts are red the ground truth does draw.
+- *A near-tangent dihedral filter*: the near-tangent edge population is real, but as a detector
+  of the strokes that actually disagree it catches 1 of 63 and 4 of 61 while destroying 56 of
+  326 and 66 of 655 good ones.
+- *An identity `BRepBuilderAPI_Transform` at import*, which re-conditions OCC's NURBS silhouette
+  fits (`003966` 0.604 → 0.689): a wash over the dev sample (3 parts better, 1 worse, means
+  unchanged) and runtime-neutral, but it reintroduces the empty-view failure of §2.2.2a on
+  parts like `001306`, which then fall back to the coarser mesh HLR. Not worth the trade.
+
+The hidden-line residual that remains is the kernel difference of `docs/KNOWN_DIFFERENCES.md`
+arising at blend corners: sharp edges of the solid that Parasolid merges away and OpenCASCADE
+draws. It is bounded (228 mm of 3242 mm of stroke on `005150`) and, per the training strategy
+in §2.4, is absorbed by SFT + RL rather than chased by rule. `prototype/diff_map.py` renders
+the per-pixel disagreement so it can be inspected and quantified rather than guessed at.
+
 ## 4. Implementation steps
 
 1. **`pyrender` package** — port the validated prototypes into the module layout of §2.1 with
@@ -277,7 +345,10 @@ in the corpus and are now handled.
 | risk | mitigation |
 |---|---|
 | HLR slow / hangs on pathological B-splines (3 of 2018 corpus parts; corpus p99 is only 6.3 s) | per-item subprocess timeout, then the **validated** mesh-based `HLRBRep_PolyAlgo` fallback (`prototype/step_render_poly.py`): < 1 s on all three pathological parts |
-| kernel classification differs from Parasolid on tangent/coincident edges | accepted — documented by challenge authors; a few short strokes per part on examples |
+| kernel classification differs from Parasolid on tangent/coincident edges | accepted — documented by challenge authors; measured at 228 mm of 3242 mm of stroke on `005150`, concentrated at blend corners. Two candidate filters were implemented and rejected on measurement (§3.3); `prototype/diff_map.py` quantifies it per part |
+| exact HLR silently abandons a whole view on a rebuilt B-rep | never rebuild the shape (§2.2.2a); a view that still comes out empty is retried on mesh HLR and then flagged in `report['empty_views']` so an incomplete drawing is never emitted silently |
+| OCC's NURBS silhouette fit diverges, drawing strokes 20-200× the part size | projected-bounding-box filter (§2.2.4a), counted in `report['offbbox_edges']`; measured no-op on 500 random parts |
+| HLR runs at the file's own scale, so a corpus of extreme-unit parts sits near OCC's absolute tolerances | scale-invariance is not available (a scaling projector or location silently mis-trims edges — FIX_IDEAS.md §1); validate the bbox at import and flag parts whose longest axis is outside a sane band |
 | challenge drawings carry SW approximate-bbox scale/offset jitter (§3.2) | accepted as target-distribution fact; mirrored as train-time augmentation (§2.4); SFT tolerates the shift, RL on the challenge corpus closes the rest |
 | multi-solid parts and STEPs with stray shells / unbounded surfaces | solids-only compound + exact `AddOptimal` bbox + validity guards (§2.2.1); genuine assemblies skipped like the SolidWorks pipeline |
 | mispaired DXF/STEP items in the challenge corpus (e.g. `000540`) | detectable by low aligned agreement; irrelevant for generated training pairs (image and label share one solid) |

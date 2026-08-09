@@ -18,8 +18,9 @@ from dxf_render import render
 MESH_DEFLECTION = 0.05  # mm on the 100 mm model
 
 
-def poly_hlr_view(shape_ocp):
-    BRepMesh_IncrementalMesh(shape_ocp, MESH_DEFLECTION)
+def poly_hlr_view(shape_ocp, deflection=MESH_DEFLECTION):
+    """Mesh HLR looking from +Z; `deflection` is in the shape's own units (mesh + sampling)."""
+    BRepMesh_IncrementalMesh(shape_ocp, deflection)
     algo = HLRBRep_PolyAlgo()
     algo.Load(shape_ocp)
     algo.Projector(HLRAlgo_Projector(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1))))
@@ -27,27 +28,37 @@ def poly_hlr_view(shape_ocp):
     hlr = HLRBRep_PolyHLRToShape()
     hlr.Update(algo)
     vis, hid = [], []
-    for getter, sink in ((hlr.VCompound, vis), (hlr.OutLineVCompound, vis),
-                         (hlr.HCompound, hid), (hlr.OutLineHCompound, hid)):
+    for name, getter, sink in (("VCompound", hlr.VCompound, vis),
+                               ("OutLineVCompound", hlr.OutLineVCompound, vis),
+                               ("HCompound", hlr.HCompound, hid),
+                               ("OutLineHCompound", hlr.OutLineHCompound, hid)):
         try:
             comp = getter()
-        except Exception:
+        except Exception as ex:  # an empty compound is normal, a raising getter is not
+            print(f"    poly HLR {name} failed: {type(ex).__name__}: {ex}", file=sys.stderr)
             continue
-        if comp is None:
+        if comp is None or comp.IsNull():
             continue
         for edge in edges_of(comp):
-            pts = discretize(edge)
+            pts = discretize(edge, deflection)
             if len(pts) >= 2:
                 sink.append(pts)
     return vis, hid
 
 
-def step_polylines_poly(step_file):
-    base = normalized_shape(step_file)
+def step_polylines_poly(step_file, report=None):
+    """Same output contract as step_polylines, mesh HLR instead of exact HLR."""
+    if report is not None:
+        report.update(dropped_bodies=0, empty_views=[])
+    base = normalized_shape(step_file, report)
     polys = []
     for name, (R, center) in VIEWS.items():
         rotated = rotate_for_view(base.wrapped, R)
         vis, hid = poly_hlr_view(rotated)
+        if not vis:
+            print(f"  {name}: VIEW IS EMPTY — render is incomplete", file=sys.stderr)
+            if report is not None:
+                report["empty_views"].append(name)
         hid = filter_coincident_hidden(vis, hid)
         cx, cy = center
         for pts in vis:
