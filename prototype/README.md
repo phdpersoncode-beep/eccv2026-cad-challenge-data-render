@@ -27,7 +27,16 @@ python /path/to/prototype/verify_pair.py /path/to/examples 000000 --save-png
 
 # side-by-side sheet from saved renders
 python /path/to/prototype/contact_sheet.py sheet.png 000000 000004 000014
+
+# where a pair disagrees, per pixel: invented strokes vs missed ones, per colour
+python /path/to/prototype/diff_map.py /path/to/examples 005150 diff.png
 ```
+
+`diff_map.py` answers the question the coverage numbers cannot: *which* strokes differ.
+Magenta/yellow are strokes we draw that the ground truth does not have, cyan/green ones we
+miss, dim grey everything both agree on; pass `x0,y0,x1,y1` to crop. It is what showed the
+hidden-line residual to be blend-corner geometry rather than the fringes it was assumed to
+be — see `../FIX_IDEAS.md` §3.
 
 `verify_pair.py` reports each pair twice: raw agreement, and agreement after fitting a
 per-part uniform scale + 3D offset (`fit_scale`, `fit_offset_mm` in the CSV). The fit
