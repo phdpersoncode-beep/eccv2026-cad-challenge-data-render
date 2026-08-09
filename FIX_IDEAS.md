@@ -55,8 +55,20 @@ emitting it silently.
 `005929` 0.780 -> 0.953, `006455` 0.648 -> 0.889, `005150` 0.636 -> 0.870.
 
 **Cost.** HLR now runs at the STEP's own scale (every challenge STEP is 1.8 mm), 55x closer
-to OCC's absolute tolerances than 100 mm, which costs 1.33x on dev and 1.46x on held-out;
-99.7 % of it is `Hide()`. Investigated and rejected: `HLRAlgo_Projector`'s `gp_Trsf`
+to OCC's absolute tolerances than 100 mm. Timing `step_polylines()` directly — *not* the
+`seconds` column of `verify_pair.py`, which also counts the cadquery/OCP import and is
+therefore worthless for comparing harnesses, and not under a parallel sweep, which was what
+made an earlier measurement of this read 1.33-1.46x — the cost is confined to the heavy tail:
+
+| sample | before | after | |
+|---|---|---|---|
+| 30 random dev parts | 18.40 s | 17.98 s | 0.98x |
+| the 8 heaviest dev parts | 40.82 s | 42.99 s | 1.05x |
+| `002313` (pathological) | 51.2 s | 81.8 s | 1.60x |
+
+So throughput on the corpus is unchanged and only pathological parts pay — which is exactly
+what the per-item timeout and the poly-HLR fallback already exist to absorb. 99.7 % of the
+time is `Hide()`. Investigated and rejected: `HLRAlgo_Projector`'s `gp_Trsf`
 constructor does accept a scale factor but HLR computes in the unscaled space
 (`Transformation().ScaleFactor()` is 1.0 while `FullTransformation()` carries the 55.6), and
 a scaling `TopLoc_Location` is accepted and *is* fast but returns curves whose trim ranges
